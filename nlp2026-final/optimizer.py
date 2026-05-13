@@ -61,7 +61,7 @@ class AdamW(Optimizer):
                 ### 완성시켜야 할 빈 코드 블록
                 # raise NotImplementedError
 
-                # ref: Decoupled Weight Decay Regularization(Ilya Loshchilov & Frank Hutter)
+                # ref: Decoupled Weight Decay Regularization (https://arxiv.org/abs/1711.05101)
                 
                 # 1st step (initialize)
                 if len(state) == 0:
@@ -80,6 +80,8 @@ class AdamW(Optimizer):
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
                 # 2. bias correction (alpha_t: step size)
+                # efficient version
+                # ref: Adam: A Method For Stochastic Optimization (https://arxiv.org/abs/1412.6980)
                 if group['correct_bias']:
                     alpha_t = group['lr'] * (math.sqrt(1.0 - beta2 ** step) / (1.0 - beta1 ** step))
                 else: 
