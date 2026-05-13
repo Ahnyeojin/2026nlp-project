@@ -59,6 +59,38 @@ class AdamW(Optimizer):
                         자세한 내용은 기본 프로젝트 안내문을 참조할 것.
                 '''
                 ### 완성시켜야 할 빈 코드 블록
-                raise NotImplementedError
+                # raise NotImplementedError
+
+                # ref: Decoupled Weight Decay Regularization(Ilya Loshchilov & Frank Hutter)
+                
+                # 1st step (initialize)
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']    
+
+                state['step'] += 1
+                step = state['step']
+                
+                # 1. moment update
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                # 2. bias correction (alpha_t: step size)
+                if group['correct_bias']:
+                    alpha_t = group['lr'] * (math.sqrt(1.0 - beta2 ** step) / (1.0 - beta1 ** step))
+                else: 
+                    alpha_t = group['lr']
+                                             
+                # 3. parameter update
+                denominator = exp_avg_sq.sqrt().add_(group["eps"])
+                p.data.addcdiv_(exp_avg, denominator, value=-alpha_t)
+
+                # 4. weight decay
+                if group['weight_decay'] > 0.0:
+                    p.data.add_(p.data, alpha=-group['lr'] * group['weight_decay'])
 
         return loss
