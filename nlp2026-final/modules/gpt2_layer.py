@@ -29,8 +29,15 @@ class GPT2Layer(nn.Module):
         이 함수에서는 Layer Normalization을 적용하지 않는다.
     """
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
 
+    # Linear Projection & Droppout
+    x = dense_layer(output)
+    x = dropout(x)
+
+    # Residual Connection
+    return input + x
+    
 
   def forward(self, hidden_states, attention_mask):
     """
