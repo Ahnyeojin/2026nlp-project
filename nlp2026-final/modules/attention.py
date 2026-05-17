@@ -35,7 +35,42 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
+  
+    # ref: Lecture Note (09.Transformers-2)
+      
+    # 1. Attention Score (Lecture Note 29p)
+    # calculate QK^T)
+    attention_scores = torch.matmul(query, key.transpose(-1, -2)) 
+
+    # 2. Scaled dot product (Lecture Note 30p)
+    # divide by sqrt{d_k}
+    attention_scores = attention_scores / (self.attention_head_size ** 0.5)
+
+    # 3. Causal mask & Padding mask
+    seq_len = attention_scores.size(-1)
+
+    # Causal mask (future token mask)
+    # create causal mask (line 55 - Gemini used)
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_scores.device), diagonal=1).bool()
+    attention_scores = attention_scores.masked_fill(causal_mask, -1e9)
+
+    # Padding mask
+    if attention_mask is not None:
+        attention_scores = attention_scores + attention_mask
+
+    # 4. Softmax
+    attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+    attention_probs = self.dropout(attention_probs)
+
+    # 5. Attention value
+    attention_val = torch.matmul(attention_probs, value)
+      
+    # 6. Merge (reverse of transform function)        
+    attention_val = rearrange(attention_val, 'b h t d -> b t h d')
+    attention_val = rearrange(attention_val, 'b t h d -> b t (h d)')
+
+    return attention_val
 
 
   def forward(self, hidden_states, attention_mask):
