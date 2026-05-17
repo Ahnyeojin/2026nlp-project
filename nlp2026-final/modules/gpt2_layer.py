@@ -49,4 +49,22 @@ class GPT2Layer(nn.Module):
     """
 
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
+
+    # 1. Causal Self-Attention
+    # normalization, self-attention, dropout & residual
+    normalized = self.attention_layer_norm(hidden_states)
+    attn_output = self.self_attention(normalized, attention_mask)
+    hidden_states = self.add(hidden_states, attn_output, self.attention_dense, self.attention_dropout)
+
+    # 2. Feed-Forward
+    # normalization, feed-forward, dropout & residual
+    normalized = self.out_layer_norm(hidden_states)
+
+    ffd_output = self.interm_dense(normalized)  # intermediate dense layer
+    ffd_output = self.interm_af(ffd_output)     # intermediate activation function
+
+    hidden_states = self.add(hidden_states, ffd_output, self.out_dense, self.out_dropout)
+
+    return hidden_states
+
