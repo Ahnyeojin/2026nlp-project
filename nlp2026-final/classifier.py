@@ -57,7 +57,10 @@ class GPT2SentimentClassifier(torch.nn.Module):
     TODO: BERT 임베딩의 감정 분류를 위해 필요한 인스턴스 변수를 생성하시오.
     '''
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
+
+    self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+    self.linear = torch.nn.Linear(config.hidden_size, config.num_labels)
 
 
   def forward(self, input_ids, attention_mask):
@@ -69,8 +72,21 @@ class GPT2SentimentClassifier(torch.nn.Module):
         적절한 반환값이 무엇인지 생각해보시오.
     '''
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
 
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    hidden_states = outputs['last_hidden_state']
+
+    token_idx = attention_mask.sum(dim=1) - 1
+
+    batch_size = input_ids.size(0)
+    last_hidden = hidden_states[torch.arange(batch_size, device=input_ids.device), token_idx]
+
+    last_hidden = self.dropout(last_hidden)
+    logits = self.linear(last_hidden)
+
+    return logits
+  
 
 class SentimentDataset(Dataset):
   def __init__(self, dataset, args):
