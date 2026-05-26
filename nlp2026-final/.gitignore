@@ -1,7 +1,16 @@
-*pretest
-*~
-*.pyc
+# 데이터셋 (용량 큼, 별도 다운로드)
+data/
+
+# 모델 가중치
 *.pt
-*.pkl
-.idea/
-out/
+
+# 학습 환경
+venv/
+__pycache__/
+*.pyc
+
+# 분석 결과 이미지
+analysis_output/
+
+# 기타
+.DS_Store
