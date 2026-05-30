@@ -14,6 +14,7 @@ ParaphraseGPT model을 훈련 및 평가하고, 필요한 제출용 파일을 �
 import argparse
 import random
 import torch
+import copy
 
 import numpy as np
 import torch.nn.functional as F
@@ -70,7 +71,19 @@ class ParaphraseGPT(nn.Module):
     패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
     """
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    # raise NotImplementedError
+
+    outputs = self.gpt(input_ids, attention_mask)
+    hidden_states = outputs
+
+    token_idx = attention_mask.sum(dim=1) - 1
+
+    batch_size = input_ids.size(0)
+    last_hidden = hidden_states[torch.arange(batch_size, device=input_ids.device), token_idx]
+
+    logits = self.paraphrase_detection_head(last_hidden)
+
+    return logits
 
 
 
@@ -110,11 +123,20 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
   best_dev_acc = 0
+  snapshots = []    # List for snapshot ensemble
 
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
+    
+    # Case: Use snapshot ensemble
+    if args.ensemble:
+      cycle = 3
+      current_lr = args.lr * (1.0 + np.cos(np.pi * (epoch % cycle) / cycle))
+      for param_group in optimizer.param_groups:
+        param_group['lr'] = max(current_lr, 1e-6)
+
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
       b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
@@ -124,9 +146,26 @@ def train(args):
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
       optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
-      preds = torch.argmax(logits, dim=1)
-      loss = F.cross_entropy(logits, labels, reduction='mean')
+
+      # Case: Use reverse pair
+      if args.reverse:
+        logits_forward = model(b_ids, b_mask)
+        loss_cross_entropy = F.cross_entropy(logits_forward, labels, reduction='mean')
+
+        b_ids_reverse = torch.flip(b_ids, dims=[1])
+        logits_reverse = model(b_ids_reverse, b_mask)
+
+        p_forward = F.log_softmax(logits_forward, dim=-1)
+        p_backward = F.softmax(logits_reverse, dim=-1)
+        loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
+
+        loss = loss_cross_entropy + loss_kl_div
+      
+      else:
+        logits = model(b_ids, b_mask)
+        preds = torch.argmax(logits, dim=1)
+        loss = F.cross_entropy(logits, labels, reduction='mean')
+
       loss.backward()
       optimizer.step()
 
@@ -143,15 +182,27 @@ def train(args):
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
 
+    if args.ensemble and (epoch % 3 == 2):
+      print(f"Snapshot Captured - Epoch: {epoch}")
+      torch.save({'snapshots': [copy.deepcopy(model.state_dict())], 'args': args}, args.filepath + '.ensemble')
+
 
 @torch.no_grad()
 def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(args.filepath)
+  
+  if args.ensemble and torch.path.extist(args.filepath + ".ensemvle"):
+    saved = torch.load(args.filepath + ".ensemble", map_location=device)
+    snapshots = saved['snapshots']
+    saved_args = saved['args']
+  else:
+    saved = torch.load(args.filepath, map_location=device)
+    snapshots = [saved['model']]
+    saved_args = saved['args']
 
-  model = ParaphraseGPT(saved['args'])
-  model.load_state_dict(saved['model'])
+  model = ParaphraseGPT(saved_args)
+  # model.load_state_dict(saved['model'])
   model = model.to(device)
   model.eval()
   print(f"Loaded model to test from {args.filepath}")
@@ -167,18 +218,49 @@ def test(args):
   para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
 
-  dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
-  print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
-  test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
+  def ensemble_inference(dataloader, is_test=False):
+    all_preds = []
+    all_sent_ids = []
 
-  with open(args.para_dev_out, "w+") as f:
+    for batch in dataloader:
+      b_ids = batch['token_ids'].to(device)
+      b_mask = batch['attention_mask'].to(device)
+      sent_ids = batch['sent_ids']
+
+      batch_probs = []
+      for state_dict in snapshots:
+        model.load_state_dict(state_dict)
+        logits = model(b_ids, b_mask)
+        batch_probs.append(F.softmax(logits, dim=-1))
+
+      avg_probs = torch.stack(batch_probs, dim=0).mean(dim=0)
+      preds = torch.argmax(avg_probs, dim=1).cpu().numpy()
+
+      all_preds.extend(preds.tolist())
+      all_sent_ids.extend(sent_ids)
+
+    return all_preds, all_sent_ids
+
+
+  # dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
+  # print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
+  # test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
+  
+  dev_preds, dev_ids = ensemble_inference(para_dev_dataloader, is_test=False)
+  test_preds, test_ids = ensemble_inference(para_test_dataloader, is_test=True)
+  
+  with open(args.para_dev_out, "w+", encoding='utf-8') as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
-    for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
+    # for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
+    #   f.write(f"{p}, {s} \n")
+    for p, s in zip(dev_ids, dev_preds):
       f.write(f"{p}, {s} \n")
 
-  with open(args.para_test_out, "w+") as f:
+  with open(args.para_test_out, "w+", encoding='utf-8') as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
-    for p, s in zip(test_para_sent_ids, test_para_y_pred):
+    # for p, s in zip(test_para_sent_ids, test_para_y_pred):
+    #   f.write(f"{p}, {s} \n")
+    for p, s in zip(test_ids, test_preds):
       f.write(f"{p}, {s} \n")
 
 
