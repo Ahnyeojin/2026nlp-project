@@ -77,16 +77,9 @@ class ParaphraseGPT(nn.Module):
     ### 완성시켜야 할 빈 코드 블록
     # raise NotImplementedError
 
-    outputs = self.gpt(input_ids, attention_mask)
-    hidden_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-
-    token_idx = attention_mask.sum(dim=1) - 1
-
-    batch_size = input_ids.size(0)
-    last_hidden = hidden_states[torch.arange(batch_size, device=input_ids.device), token_idx]
-
-    logits = self.paraphrase_detection_head(last_hidden)
-
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    last_token = outputs['last_token']  # [batch, hidden_size]
+    logits = self.gpt.hidden_state_to_token(last_token)  # [batch, vocab_size]
     return logits
 
 
@@ -242,10 +235,13 @@ def test(args):
         model.eval()
 
         logits = model(b_ids, b_mask)
-        batch_probs.append(F.softmax(logits, dim=-1))
+        yes_no_logits = logits[:, [NO_TOKEN_ID, YES_TOKEN_ID]]  # [batch, 2]: [no, yes]
+        batch_probs.append(F.softmax(yes_no_logits, dim=-1))
 
-      avg_probs = torch.stack(batch_probs, dim=0).mean(dim=0)
-      preds = torch.argmax(avg_probs, dim=1).cpu().numpy()
+      avg_probs = torch.stack(batch_probs, dim=0).mean(dim=0)   # [batch, 2]
+      binary_preds = torch.argmax(avg_probs, dim=1)              # 0=no, 1=yes
+      token_map = torch.tensor([NO_TOKEN_ID, YES_TOKEN_ID], device=device)
+      preds = token_map[binary_preds].cpu().numpy()
 
       all_preds.extend(preds.tolist())
       all_sent_ids.extend(sent_ids)
