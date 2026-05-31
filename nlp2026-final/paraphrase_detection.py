@@ -152,8 +152,9 @@ def train(args):
         logits_forward = model(b_ids, b_mask)
         loss_cross_entropy = F.cross_entropy(logits_forward, labels, reduction='mean')
 
-        b_ids_reverse = torch.flip(b_ids, dims=[1])
-        logits_reverse = model(b_ids_reverse, b_mask)
+        b_ids_reverse = batch['reverse_token_ids'].to(device)
+        b_mask_reverse = batch['reverse_attention_mask'].to(device)
+        logits_reverse = model(b_ids_reverse, b_mask_reverse)
 
         p_forward = F.log_softmax(logits_forward, dim=-1)
         p_backward = F.softmax(logits_reverse, dim=-1)
