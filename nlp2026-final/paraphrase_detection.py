@@ -11,6 +11,7 @@ Paraphrase detection을 위한 시작 코드.
 ParaphraseGPT model을 훈련 및 평가하고, 필요한 제출용 파일을 작성한다.
 '''
 
+import os
 import argparse
 import random
 import torch
@@ -32,6 +33,9 @@ from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
+
+YES_TOKEN_ID = 8505
+NO_TOKEN_ID = 3919
 
 TQDM_DISABLE = False
 
@@ -74,7 +78,7 @@ class ParaphraseGPT(nn.Module):
     # raise NotImplementedError
 
     outputs = self.gpt(input_ids, attention_mask)
-    hidden_states = outputs
+    hidden_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
 
     token_idx = attention_mask.sum(dim=1) - 1
 
@@ -108,12 +112,12 @@ def train(args):
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
 
-  para_train_data = ParaphraseDetectionDataset(para_train_data, args)
-  para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
+  para_train_dataset = ParaphraseDetectionDataset(para_train_data, args)
+  para_dev_dataset = ParaphraseDetectionDataset(para_dev_data, args)
 
-  para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
+  para_train_dataloader = DataLoader(para_train_dataset, shuffle=True, batch_size=args.batch_size,
                                      collate_fn=para_train_data.collate_fn)
-  para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
+  para_dev_dataloader = DataLoader(para_dev_dataset, shuffle=False, batch_size=args.batch_size,
                                    collate_fn=para_dev_data.collate_fn)
 
   args = add_arguments(args)
@@ -139,10 +143,15 @@ def train(args):
 
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
-      b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
+      b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels']
       b_ids = b_ids.to(device)
       b_mask = b_mask.to(device)
       labels = labels.to(device)
+
+      if labels.dim() == 2:
+        mapped_labels = torch.any(labels == YES_TOKEN_ID, dim=1).long()
+      else:
+        mapped_labels = (labels == YES_TOKEN_ID).long()
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
       optimizer.zero_grad()
@@ -150,7 +159,7 @@ def train(args):
       # Case: Use reverse pair
       if args.reverse:
         logits_forward = model(b_ids, b_mask)
-        loss_cross_entropy = F.cross_entropy(logits_forward, labels, reduction='mean')
+        loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
 
         b_ids_reverse = batch['reverse_token_ids'].to(device)
         b_mask_reverse = batch['reverse_attention_mask'].to(device)
@@ -165,7 +174,7 @@ def train(args):
       else:
         logits = model(b_ids, b_mask)
         preds = torch.argmax(logits, dim=1)
-        loss = F.cross_entropy(logits, labels, reduction='mean')
+        loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
 
       loss.backward()
       optimizer.step()
@@ -185,7 +194,8 @@ def train(args):
 
     if args.ensemble and (epoch % 3 == 2):
       print(f"Snapshot Captured - Epoch: {epoch}")
-      torch.save({'snapshots': [copy.deepcopy(model.state_dict())], 'args': args}, args.filepath + '.ensemble')
+      snapshots.append(copy.deepcopy(model.state_dict()))
+      torch.save({'snapshots': snapshots, 'args': args}, args.filepath + '.ensemble')
 
 
 @torch.no_grad()
@@ -193,7 +203,7 @@ def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   
-  if args.ensemble and torch.path.extist(args.filepath + ".ensemvle"):
+  if args.ensemble and os.path.exists(args.filepath + ".ensemble"):
     saved = torch.load(args.filepath + ".ensemble", map_location=device)
     snapshots = saved['snapshots']
     saved_args = saved['args']
@@ -203,9 +213,8 @@ def test(args):
     saved_args = saved['args']
 
   model = ParaphraseGPT(saved_args)
-  # model.load_state_dict(saved['model'])
   model = model.to(device)
-  model.eval()
+
   print(f"Loaded model to test from {args.filepath}")
 
   para_dev_data = load_paraphrase_data(args.para_dev)
@@ -216,9 +225,8 @@ def test(args):
 
   para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
                                    collate_fn=para_dev_data.collate_fn)
-  para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
+  para_test_dataloader = DataLoader(para_test_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
-
   def ensemble_inference(dataloader, is_test=False):
     all_preds = []
     all_sent_ids = []
@@ -231,6 +239,8 @@ def test(args):
       batch_probs = []
       for state_dict in snapshots:
         model.load_state_dict(state_dict)
+        model.eval()
+
         logits = model(b_ids, b_mask)
         batch_probs.append(F.softmax(logits, dim=-1))
 
@@ -283,6 +293,9 @@ def get_args():
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+  
+  parser.add_argument("--reverse", action='store_true', help='use reverse pair for training')
+  parser.add_argument("--ensemble", action='store_true', help='activate snapshot ensemble')
 
   args = parser.parse_args()
   return args
