@@ -127,6 +127,9 @@ def train(args):
     train_loss = 0
     num_batches = 0
     
+    num_samples = 0
+    train_disagr_count = 0
+
     # Case: Use snapshot ensemble
     if args.ensemble:
       cycle = 3
@@ -150,7 +153,7 @@ def train(args):
       optimizer.zero_grad()
 
       # Case: Use reverse pair
-      if args.reverse:
+      if args.reverse > 0.0:
         logits_forward = model(b_ids, b_mask)
         loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
 
@@ -162,7 +165,13 @@ def train(args):
         p_backward = F.softmax(logits_reverse, dim=-1)
         loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
 
-        loss = loss_cross_entropy + loss_kl_div
+        loss = loss_cross_entropy + (args.reverse * loss_kl_div)
+
+        # check disagreement of forward-reverse pair
+        preds_forward = torch.argmax(logits_forward, dim=1)
+        preds_reverse = torch.argmax(logits_reverse, dim=1)
+        train_disagr_count += (preds_forward != preds_reverse).sum().item()
+        num_samples += labels.size(0)
       
       else:
         logits = model(b_ids, b_mask)
@@ -176,6 +185,7 @@ def train(args):
       num_batches += 1
 
     train_loss = train_loss / num_batches
+    train_disagr_rate = (train_disagr_count / num_samples) if num_samples > 0 else 0.0    # forward-reverse disagreement rate
 
     dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
 
@@ -183,7 +193,7 @@ def train(args):
       best_dev_acc = dev_acc
       save_model(model, optimizer, args, args.filepath)
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train disagreement :: {train_disagr_rate :.3f} dev acc :: {dev_acc :.3f}")
 
     if args.ensemble and (epoch % 3 == 2):
       print(f"Snapshot Captured - Epoch: {epoch}")
@@ -224,12 +234,24 @@ def test(args):
     all_preds = []
     all_sent_ids = []
 
+    # variables for calculating forward-reverse disagreement rate
+    num_samples = 0
+    test_disagr_count = 0
+    disagr_rate = 0.0
+
     for batch in dataloader:
       b_ids = batch['token_ids'].to(device)
       b_mask = batch['attention_mask'].to(device)
       sent_ids = batch['sent_ids']
 
+      has_reverse = 'reverse_token_ids' in batch
+      if has_reverse:
+        b_ids_reverse = batch['reverse_token_ids'].to(device)
+        b_mask_reverse = batch['reverse_attention_mask'].to(device)
+
       batch_probs = []
+      batch_reverse_probs = []    # for reverse pair test
+
       for state_dict in snapshots:
         model.load_state_dict(state_dict)
         model.eval()
@@ -238,23 +260,37 @@ def test(args):
         yes_no_logits = logits[:, [NO_TOKEN_ID, YES_TOKEN_ID]]  # [batch, 2]: [no, yes]
         batch_probs.append(F.softmax(yes_no_logits, dim=-1))
 
+        if has_reverse:
+          logits_reverse = model(b_ids_reverse, b_mask_reverse)
+          yes_no_logits_reverse = logits_reverse[:, [NO_TOKEN_ID, YES_TOKEN_ID]]
+          batch_reverse_probs.append(F.softmax(yes_no_logits_reverse, dim=-1))
+
       avg_probs = torch.stack(batch_probs, dim=0).mean(dim=0)   # [batch, 2]
       binary_preds = torch.argmax(avg_probs, dim=1)              # 0=no, 1=yes
+      
+      if has_reverse:
+        avg_reverse_probs = torch.stack(batch_reverse_probs, dim=0).mean(dim=0)
+        binary_preds_reverse = torch.argmax(avg_reverse_probs, dim=1)
+        test_disagr_count += (binary_preds != binary_preds_reverse).sum().item()
+        num_samples += b_ids.size(0)
+      
       token_map = torch.tensor([NO_TOKEN_ID, YES_TOKEN_ID], device=device)
       preds = token_map[binary_preds].cpu().numpy()
 
       all_preds.extend(preds.tolist())
       all_sent_ids.extend(sent_ids)
 
-    return all_preds, all_sent_ids
+      disagr_rate = (test_disagr_count / num_samples) if num_samples > 0 else 0.0
+
+    return all_preds, all_sent_ids, disagr_rate
 
 
   # dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
   # print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
   # test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
   
-  dev_preds, dev_ids = ensemble_inference(para_dev_dataloader, is_test=False)
-  test_preds, test_ids = ensemble_inference(para_test_dataloader, is_test=True)
+  dev_preds, dev_ids, dev_disagr_rate = ensemble_inference(para_dev_dataloader, is_test=False)
+  test_preds, test_ids, test_disagr_rate = ensemble_inference(para_test_dataloader, is_test=True)
   
   with open(args.para_dev_out, "w+", encoding='utf-8') as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
@@ -262,6 +298,8 @@ def test(args):
     #   f.write(f"{p}, {s} \n")
     for p, s in zip(dev_ids, dev_preds):
       f.write(f"{p}, {s} \n")
+    
+    f.write(f"# Summary:: Lambda={args.reverse}, Disagr Rate={dev_disagr_rate:.3f}")
 
   with open(args.para_test_out, "w+", encoding='utf-8') as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
@@ -269,6 +307,8 @@ def test(args):
     #   f.write(f"{p}, {s} \n")
     for p, s in zip(test_ids, test_preds):
       f.write(f"{p}, {s} \n")
+
+    f.write(f"# Summary:: Lambda={args.reverse}, Disagr Rate={test_disagr_rate:.3f}")
 
 
 def get_args():
@@ -290,7 +330,7 @@ def get_args():
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
   
-  parser.add_argument("--reverse", action='store_true', help='use reverse pair for training')
+  parser.add_argument("--reverse", type=float, default=0.0, help='coefficient value of KL divergence loss')
   parser.add_argument("--ensemble", action='store_true', help='activate snapshot ensemble')
 
   args = parser.parse_args()
