@@ -60,7 +60,9 @@ class ParaphraseDetectionDataset(Dataset):
     }
 
     # create reverse pair of cloze style question
-    if getattr(self.p, 'reverse', False):
+    reverse_val = getattr(self.p, 'reverse', 0.0)
+    if reverse_val > 0.0:
+      # reverse question: swapping s1 and s2
       reverse_cloze_style_sents = [f'Question 1: "{s2}"\nQuestion 2: "{s1}\nAre these questions asking the same thing?\n' for
                          (s1, s2) in zip(sent1, sent2)]
       reverse_encoding = self.tokenizer(reverse_cloze_style_sents, return_tensors='pt', padding=True, truncation=True)
@@ -68,6 +70,7 @@ class ParaphraseDetectionDataset(Dataset):
       reverse_token_ids = torch.LongTensor(reverse_encoding['input_ids'])
       reverse_attention_mask = torch.LongTensor(reverse_encoding['attention_mask'])
       
+      # add reverse pair
       batched_data['reverse_token_ids'] = reverse_token_ids
       batched_data['reverse_attention_mask'] = reverse_attention_mask
 
@@ -105,6 +108,19 @@ class ParaphraseDetectionTestDataset(Dataset):
       'attention_mask': attention_mask,
       'sent_ids': sent_ids
     }
+
+    # create reverse pair of cloze style question
+    reverse_val = getattr(self.p, 'reverse', 0.0)
+    if reverse_val > 0.0:
+      reverse_cloze_style_sents = [f'Is "{s2}" a paraphrase of "{s1}"? Answer "yes" or "no": ' for (s1, s2)
+                                   in zip(sent1, sent2)]
+      reverse_encoding = self.tokenizer(reverse_cloze_style_sents, return_tensors='pt', padding=True, truncation=True)
+
+      reverse_token_ids = torch.LongTensor(reverse_encoding['input_ids'])
+      reverse_attention_mask = torch.LongTensor(reverse_encoding['attention_mask'])
+
+      batched_data['reverse_token_ids'] = reverse_token_ids
+      batched_data['reverse_attention_mask'] = reverse_attention_mask
 
     return batched_data
 
