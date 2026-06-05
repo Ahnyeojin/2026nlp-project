@@ -122,6 +122,9 @@ def train(args):
   best_dev_acc = 0
   snapshots = []    # List for snapshot ensemble
 
+  is_ensemble = args.ensemble > 1
+  cycle_length = args.epochs / args.ensemble if is_ensemble else float(args.epochs)
+
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
@@ -131,9 +134,9 @@ def train(args):
     train_disagr_count = 0
 
     # Case: Use snapshot ensemble
-    if args.ensemble:
-      cycle = 3
-      current_lr = args.lr * (1.0 + np.cos(np.pi * (epoch % cycle) / cycle))
+    if is_ensemble:
+      epoch_per_cycle = epoch % cycle_length
+      current_lr = args.lr * (1.0 + np.cos(np.pi * epoch_per_cycle / cycle_length)) / 2.0
       for param_group in optimizer.param_groups:
         param_group['lr'] = max(current_lr, 1e-6)
 
@@ -195,10 +198,12 @@ def train(args):
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train disagreement :: {train_disagr_rate :.3f} dev acc :: {dev_acc :.3f}")
 
-    if args.ensemble and (epoch % 3 == 2):
-      print(f"Snapshot Captured - Epoch: {epoch}")
-      snapshots.append(copy.deepcopy(model.state_dict()))
-      torch.save({'snapshots': snapshots, 'args': args}, args.filepath + '.ensemble')
+    if is_ensemble:
+      is_cycle_end = int((epoch + 1) % cycle_length) == 0 or (epoch == args.epochs - 1)
+      if is_cycle_end and len(snapshots) < args.ensemble:
+        print(f"Snapshot Captured - Epoch: {epoch}")
+        snapshots.append(copy.deepcopy(model.state_dict()))
+        torch.save({'snapshots': snapshots, 'args': args}, args.filepath + '.ensemble')
 
 
 @torch.no_grad()
@@ -206,7 +211,8 @@ def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   
-  if args.ensemble and os.path.exists(args.filepath + ".ensemble"):
+  is_ensemble = args.ensemble > 1
+  if is_ensemble and os.path.exists(args.filepath + ".ensemble"):
     saved = torch.load(args.filepath + ".ensemble", map_location=device)
     snapshots = saved['snapshots']
     saved_args = saved['args']
@@ -331,7 +337,7 @@ def get_args():
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
   
   parser.add_argument("--reverse", type=float, default=0.0, help='coefficient value of KL divergence loss')
-  parser.add_argument("--ensemble", action='store_true', help='activate snapshot ensemble')
+  parser.add_argument("--ensemble", type=int,  default=1, help='number of ensemble snapshots')
 
   args = parser.parse_args()
   return args
