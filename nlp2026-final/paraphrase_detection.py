@@ -48,6 +48,8 @@ def seed_everything(seed=11711):
   torch.cuda.manual_seed_all(seed)
   torch.backends.cudnn.benchmark = False
   torch.backends.cudnn.deterministic = True
+  torch.backends.cuda.matmul.allow_tf32 = True   # Tensor Core 활성화
+  torch.backends.cudnn.allow_tf32 = True
 
 
 class ParaphraseGPT(nn.Module):
@@ -148,9 +150,12 @@ def train(args):
       labels = labels.to(device)
 
       if labels.dim() == 2:
-        mapped_labels = torch.any(labels == YES_TOKEN_ID, dim=1).long()
+        is_yes = torch.any(labels == YES_TOKEN_ID, dim=1)
       else:
-        mapped_labels = (labels == YES_TOKEN_ID).long()
+        is_yes = (labels == YES_TOKEN_ID)
+      yes_t = torch.tensor(YES_TOKEN_ID, dtype=torch.long, device=labels.device)
+      no_t  = torch.tensor(NO_TOKEN_ID,  dtype=torch.long, device=labels.device)
+      mapped_labels = torch.where(is_yes, yes_t, no_t)
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
       optimizer.zero_grad()
