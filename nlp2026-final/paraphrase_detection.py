@@ -16,6 +16,7 @@ import argparse
 import random
 import torch
 import copy
+import math
 
 import numpy as np
 import torch.nn.functional as F
@@ -52,6 +53,43 @@ def seed_everything(seed=11711):
   torch.backends.cudnn.allow_tf32 = True
 
 
+# class for Boosting
+class BoostingAdaptor(nn.Module):
+  def __init__(self, in_dim, out_dim, rank=4, alpha=8):
+    super().__init__()
+    self.rank = rank
+    self.scaling = alpha / rank
+
+    # compressor: input dimension -> rank
+    self.compressor = nn.Parameter(torch.zeros(in_dim, rank))
+    # expander: rank -> output dimension
+    self.expander = nn.Parameter(torch.zeros(rank, out_dim))
+
+    self.compressor.requires_grad = False
+    self.expander.requires_grad = False
+
+    self.is_activated = False
+    self.reset_params()
+
+  def reset_params(self):
+    nn.init.kaiming_uniform_(self.compressor, a=math.sqrt(5))
+    nn.init.zeros_(self.expander)
+
+  def activate_boosting(self):
+    self.compressor.requires_grad_(True)
+    self.expander.requires_grad_(True)
+    self.is_activated = True
+
+  def forward(self, x):
+    if self.compressor.requires_grad or self.is_activated:
+      compressed = torch.matmul(x, self.compressor)
+      expanded = torch.matmul(compressed, self.expander)
+
+      return expanded * self.scaling
+    
+    return 0.0
+
+
 class ParaphraseGPT(nn.Module):
   """Paraphrase Detection을 위해 설계된 여러분의 GPT-2 Model."""
 
@@ -63,6 +101,13 @@ class ParaphraseGPT(nn.Module):
     # 기본적으로, 전체 모델을 finetuning 한다.
     for param in self.gpt.parameters():
       param.requires_grad = True
+
+    self.boosting = getattr(args, 'boosting', False)
+    if self.boosting:
+      self.adaptor_layers = nn.ModuleList([
+        BoostingAdaptor(in_dim=args.d, out_dim=args.d, rank=4)
+        for _ in range(args.l)
+      ]) 
 
   def forward(self, input_ids, attention_mask):
     """
@@ -80,11 +125,26 @@ class ParaphraseGPT(nn.Module):
     # raise NotImplementedError
 
     outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
-    last_token = outputs['last_token']  # [batch, hidden_size]
-    logits = self.gpt.hidden_state_to_token(last_token)  # [batch, vocab_size]
+    last_token = outputs['last_token']
+    
+    if self.boosting:
+      correction = 0.0
+      for adaptor_layer in self.adaptor_layers:
+        correction += adaptor_layer(last_token)
+      last_token = last_token + correction
+
+    logits = self.paraphrase_detection_head(last_token)
     return logits
+    
+  def activate_adaptor_layer(self):
+    for param in self.gpt.parameters():
+      param.requires_grad = False
+    for param in self.paraphrase_detection_head.parameters():
+      param.requires_grad = False
 
-
+    for adaptor_layer in self.adaptor_layers:
+      adaptor_layer.activate_boosting()
+    
 
 def save_model(model, optimizer, args, filepath):
   save_info = {
@@ -110,7 +170,7 @@ def train(args):
   para_train_dataset = ParaphraseDetectionDataset(para_train_data, args)
   para_dev_dataset = ParaphraseDetectionDataset(para_dev_data, args)
 
-  para_train_dataloader = DataLoader(para_train_dataset, shuffle=True, batch_size=args.batch_size,
+  current_dataloader = DataLoader(para_train_dataset, shuffle=True, batch_size=args.batch_size,
                                      collate_fn=para_train_dataset.collate_fn)
   para_dev_dataloader = DataLoader(para_dev_dataset, shuffle=False, batch_size=args.batch_size,
                                    collate_fn=para_dev_dataset.collate_fn)
@@ -127,7 +187,27 @@ def train(args):
   is_ensemble = args.ensemble > 1
   cycle_length = args.epochs / args.ensemble if is_ensemble else float(args.epochs)
 
+  pre_boosting = args.epochs // 2
+  is_boosting = args.boosting
+  hard_samples = {}   # hard sample dictionary for boosing
+
   for epoch in range(args.epochs):
+    # Case: Use boosting - implement LoRA based boosting
+    if is_boosting and (epoch == pre_boosting):
+      hard_samples_pool = list(hard_samples.values())
+      print(f"\n=== debug:: [Boosting] {epoch}epoch")
+
+      if len(hard_samples_pool) > 0:
+        model.activate_adaptor_layer()
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                   lr=args.lr, weight_decay=0.)
+        boosting_dataset = copy.copy(para_train_dataset)
+        boosting_dataset.data = hard_samples_pool
+        current_dataloader = DataLoader(boosting_dataset, shuffle=True, batch_size=args.batch_size,
+                                            collate_fn=boosting_dataset.collate_fn)
+      else:
+        print("\n=== debug:: No Hard Samples")
+
     model.train()
     train_loss = 0
     num_batches = 0
@@ -142,7 +222,7 @@ def train(args):
       for param_group in optimizer.param_groups:
         param_group['lr'] = max(current_lr, 1e-6)
 
-    for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+    for batch in tqdm(current_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
       b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels']
       b_ids = b_ids.to(device)
@@ -153,9 +233,9 @@ def train(args):
         is_yes = torch.any(labels == YES_TOKEN_ID, dim=1)
       else:
         is_yes = (labels == YES_TOKEN_ID)
-      yes_t = torch.tensor(YES_TOKEN_ID, dtype=torch.long, device=labels.device)
-      no_t  = torch.tensor(NO_TOKEN_ID,  dtype=torch.long, device=labels.device)
-      mapped_labels = torch.where(is_yes, yes_t, no_t)
+      # yes_t = torch.tensor(YES_TOKEN_ID, dtype=torch.long, device=labels.device)
+      # no_t  = torch.tensor(NO_TOKEN_ID,  dtype=torch.long, device=labels.device)
+      mapped_labels = torch.where(is_yes, torch.tensor(1, device=device), torch.tensor(0, device=device))
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
       optimizer.zero_grad()
@@ -180,15 +260,32 @@ def train(args):
         preds_reverse = torch.argmax(logits_reverse, dim=1)
         train_disagr_count += (preds_forward != preds_reverse).sum().item()
         num_samples += labels.size(0)
-      
+
+        preds = preds_forward
+        correct_forward = (preds_forward == mapped_labels)
+        correct_reverse = (preds_reverse == mapped_labels)
+        is_correct = correct_forward & correct_reverse
       else:
         logits = model(b_ids, b_mask)
         preds = torch.argmax(logits, dim=1)
         loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
+        is_correct = (preds == mapped_labels)
 
       loss.backward()
       optimizer.step()
 
+      if is_boosting and (epoch < pre_boosting):
+        correct_mask = is_correct.cpu().numpy()
+        for i in range(len(b_ids)):
+          sample_id = batch['sent_ids'][i]
+
+          if not correct_mask[i]:
+            sample_data = {k: v[i].cpu() if isinstance(v, torch.Tensor) else v[i]
+                           for k, v in batch.items()}
+            hard_samples[sample_id] = sample_data
+          else:
+            hard_samples.pop(sample_id, None)
+          
       train_loss += loss.item()
       num_batches += 1
 
@@ -264,12 +361,16 @@ def test(args):
       batch_reverse_probs = []    # for reverse pair test
 
       for state_dict in snapshots:
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
+
+        if model.boosting:
+          for layer in model.adaptor_layers:
+            layer.is_activated = True
+
         model.eval()
 
         logits = model(b_ids, b_mask)
-        yes_no_logits = logits[:, [NO_TOKEN_ID, YES_TOKEN_ID]]  # [batch, 2]: [no, yes]
-        batch_probs.append(F.softmax(yes_no_logits, dim=-1))
+        batch_probs.append(F.softmax(logits, dim=-1))
 
         if has_reverse:
           logits_reverse = model(b_ids_reverse, b_mask_reverse)
@@ -343,6 +444,7 @@ def get_args():
   
   parser.add_argument("--reverse", type=float, default=0.0, help='coefficient value of KL divergence loss')
   parser.add_argument("--ensemble", type=int,  default=1, help='number of ensemble snapshots')
+  parser.add_argument("--boosting", action='store_true', help='Activate LoRA based boosting')
 
   args = parser.parse_args()
   return args
