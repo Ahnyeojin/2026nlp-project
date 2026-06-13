@@ -144,6 +144,19 @@ class ParaphraseGPT(nn.Module):
 
     for adaptor_layer in self.adaptor_layers:
       adaptor_layer.activate_boosting()
+  
+  def deactivate_and_reset_adaptor_layer(self):
+        for param in self.gpt.parameters():
+            param.requires_grad = True
+        for param in self.paraphrase_detection_head.parameters():
+            param.requires_grad = True
+
+        if self.boosting:
+            for adaptor_layer in self.adaptor_layers:
+                adaptor_layer.compressor.requires_grad_(False)
+                adaptor_layer.expander.requires_grad_(False)
+                adaptor_layer.is_activated = False
+                adaptor_layer.reset_params()
     
 
 def save_model(model, optimizer, args, filepath):
@@ -187,15 +200,21 @@ def train(args):
   is_ensemble = args.ensemble > 1
   cycle_length = args.epochs / args.ensemble if is_ensemble else float(args.epochs)
 
-  pre_boosting = args.epochs // 2
+  #pre_boosting = args.epochs // 2
   is_boosting = args.boosting
   hard_samples = {}   # hard sample dictionary for boosing
 
   for epoch in range(args.epochs):
-    # Case: Use boosting - implement LoRA based boosting
-    if is_boosting and (epoch == pre_boosting):
+    epoch_in_cycle = epoch % cycle_length if is_ensemble else epoch
+    current_cycle_idx = epoch // cycle_length if is_ensemble else 0
+    
+    is_boosting_epoch = is_boosting and (epoch_in_cycle == cycle_length - 1)
+    is_cycle_restart_epoch = is_ensemble and (epoch_in_cycle == 0) and (current_cycle_idx > 0)
+
+    # Case: Use boosting - implement boosting
+    if is_boosting_epoch:
       hard_samples_pool = list(hard_samples.values())
-      print(f"\n=== debug:: [Boosting] {epoch}epoch")
+      print(f"\n=== debug:: [Boosting] {epoch} epoch")
 
       if len(hard_samples_pool) > 0:
         model.activate_adaptor_layer()
@@ -207,6 +226,12 @@ def train(args):
                                             collate_fn=boosting_dataset.collate_fn)
       else:
         print("\n=== debug:: No Hard Samples")
+    elif is_cycle_restart_epoch:
+      print(f"\n=== debug:: [Cycle Restart] {epoch} epoch")
+      model.deactivate_and_reset_adaptor_layer()
+      optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.)
+      current_dataloader = DataLoader(para_train_dataset, shuffle=True, batch_size=args.batch_size, 
+                                      collate_fn=para_train_dataset.collate_fn)
 
     model.train()
     train_loss = 0
@@ -274,7 +299,7 @@ def train(args):
       loss.backward()
       optimizer.step()
 
-      if is_boosting and (epoch < pre_boosting):
+      if is_boosting and (not is_boosting_epoch):
         correct_mask = is_correct.cpu().numpy()
         for i in range(len(b_ids)):
           sample_id = batch['sent_ids'][i]
@@ -347,6 +372,9 @@ def test(args):
     test_disagr_count = 0
     disagr_rate = 0.0
 
+    total_correct = 0
+    total_samples = 0
+
     for batch in dataloader:
       b_ids = batch['token_ids'].to(device)
       b_mask = batch['attention_mask'].to(device)
@@ -380,30 +408,43 @@ def test(args):
       avg_probs = torch.stack(batch_probs, dim=0).mean(dim=0)   # [batch, 2]
       binary_preds = torch.argmax(avg_probs, dim=1)              # 0=no, 1=yes
       
+      if 'labels' in batch:
+        labels = batch['labels'].to(device)
+        is_yes = torch.any(labels == YES_TOKEN_ID, dim=1) if labels.dim() == 2 else (labels == YES_TOKEN_ID)
+        mapped_labels = torch.where(is_yes, torch.tensor(1, device=device), torch.tensor(0, device=device))
+            
+        # 예측값과 실제 정답 라벨 비교 후 일치하는 개수 누적
+        total_correct += (binary_preds == mapped_labels).sum().item()
+        total_samples += labels.size(0)
+        
       if has_reverse:
         avg_reverse_probs = torch.stack(batch_reverse_probs, dim=0).mean(dim=0)
         binary_preds_reverse = torch.argmax(avg_reverse_probs, dim=1)
         test_disagr_count += (binary_preds != binary_preds_reverse).sum().item()
         num_samples += b_ids.size(0)
-      
+
+
       token_map = torch.tensor([NO_TOKEN_ID, YES_TOKEN_ID], device=device)
       preds = token_map[binary_preds].cpu().numpy()
 
       all_preds.extend(preds.tolist())
       all_sent_ids.extend(sent_ids)
 
-      disagr_rate = (test_disagr_count / num_samples) if num_samples > 0 else 0.0
+    disagr_rate = (test_disagr_count / num_samples) if num_samples > 0 else 0.0
+    accuracy = (total_correct / total_samples) if total_samples > 0 else 0.0
 
-    return all_preds, all_sent_ids, disagr_rate
+    return all_preds, all_sent_ids, disagr_rate, accuracy
 
 
   # dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
-  # print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
   # test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
   
-  dev_preds, dev_ids, dev_disagr_rate = ensemble_inference(para_dev_dataloader, is_test=False)
-  test_preds, test_ids, test_disagr_rate = ensemble_inference(para_test_dataloader, is_test=True)
   
+  dev_preds, dev_ids, dev_disagr_rate, dev_para_acc = ensemble_inference(para_dev_dataloader, is_test=False)
+  test_preds, test_ids, test_disagr_rate, _ = ensemble_inference(para_test_dataloader, is_test=True)
+  print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
+
+
   with open(args.para_dev_out, "w+", encoding='utf-8') as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     # for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
