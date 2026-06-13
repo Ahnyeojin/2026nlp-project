@@ -25,15 +25,24 @@ def model_eval_paraphrase(dataloader, model, device):
   y_true, y_pred, sent_ids = [], [], []
   for step, batch in enumerate(tqdm(dataloader, desc=f'eval', disable=TQDM_DISABLE)):
     b_ids, b_mask, b_sent_ids, labels = batch['token_ids'], batch['attention_mask'], batch['sent_ids'], batch[
-      'labels'].flatten()
+      'labels']
 
     b_ids = b_ids.to(device)
     b_mask = b_mask.to(device)
+    labels = labels.to(device)
+
+    if labels.dim() == 2:
+      is_yes = torch.any(labels == 8505, dim=1)
+    else:
+      is_yes = (labels == 8505)
+
+    mapped_labels = torch.where(is_yes, torch.tensor(1, device=device), torch.tensor(0, device=device))
+    mapped_labels = mapped_labels.cpu().numpy().flatten()
 
     logits = model(b_ids, b_mask).cpu().numpy()
     preds = np.argmax(logits, axis=1).flatten()
 
-    y_true.extend(labels)
+    y_true.extend(mapped_labels)
     y_pred.extend(preds)
     sent_ids.extend(b_sent_ids)
 
