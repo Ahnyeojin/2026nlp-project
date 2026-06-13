@@ -20,6 +20,7 @@ import math
 
 import numpy as np
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -194,6 +195,7 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  scaler = GradScaler()   # AMP scaler for FP16
   best_dev_acc = 0
   snapshots = []    # List for snapshot ensemble
 
@@ -262,42 +264,44 @@ def train(args):
       # no_t  = torch.tensor(NO_TOKEN_ID,  dtype=torch.long, device=labels.device)
       mapped_labels = torch.where(is_yes, torch.tensor(1, device=device), torch.tensor(0, device=device))
 
-      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
+      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
 
-      # Case: Use reverse pair
-      if args.reverse > 0.0:
-        logits_forward = model(b_ids, b_mask)
-        loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
+      with autocast():
+        # Case: Use reverse pair
+        if args.reverse > 0.0:
+          logits_forward = model(b_ids, b_mask)
+          loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
 
-        b_ids_reverse = batch['reverse_token_ids'].to(device)
-        b_mask_reverse = batch['reverse_attention_mask'].to(device)
-        logits_reverse = model(b_ids_reverse, b_mask_reverse)
+          b_ids_reverse = batch['reverse_token_ids'].to(device)
+          b_mask_reverse = batch['reverse_attention_mask'].to(device)
+          logits_reverse = model(b_ids_reverse, b_mask_reverse)
 
-        p_forward = F.log_softmax(logits_forward, dim=-1)
-        p_backward = F.softmax(logits_reverse, dim=-1)
-        loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
+          p_forward = F.log_softmax(logits_forward, dim=-1)
+          p_backward = F.softmax(logits_reverse, dim=-1)
+          loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
 
-        loss = loss_cross_entropy + (args.reverse * loss_kl_div)
+          loss = loss_cross_entropy + (args.reverse * loss_kl_div)
 
-        # check disagreement of forward-reverse pair
-        preds_forward = torch.argmax(logits_forward, dim=1)
-        preds_reverse = torch.argmax(logits_reverse, dim=1)
-        train_disagr_count += (preds_forward != preds_reverse).sum().item()
-        num_samples += labels.size(0)
+          # check disagreement of forward-reverse pair
+          preds_forward = torch.argmax(logits_forward, dim=1)
+          preds_reverse = torch.argmax(logits_reverse, dim=1)
+          train_disagr_count += (preds_forward != preds_reverse).sum().item()
+          num_samples += labels.size(0)
 
-        preds = preds_forward
-        correct_forward = (preds_forward == mapped_labels)
-        correct_reverse = (preds_reverse == mapped_labels)
-        is_correct = correct_forward & correct_reverse
-      else:
-        logits = model(b_ids, b_mask)
-        preds = torch.argmax(logits, dim=1)
-        loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
-        is_correct = (preds == mapped_labels)
+          preds = preds_forward
+          correct_forward = (preds_forward == mapped_labels)
+          correct_reverse = (preds_reverse == mapped_labels)
+          is_correct = correct_forward & correct_reverse
+        else:
+          logits = model(b_ids, b_mask)
+          preds = torch.argmax(logits, dim=1)
+          loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
+          is_correct = (preds == mapped_labels)
 
-      loss.backward()
-      optimizer.step()
+      scaler.scale(loss).backward()
+      scaler.step(optimizer)
+      scaler.update()
 
       if is_boosting and (not is_boosting_epoch):
         correct_mask = is_correct.cpu().numpy()

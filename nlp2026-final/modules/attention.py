@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 
 from einops import rearrange
 from torch import nn
@@ -12,29 +12,29 @@ class CausalSelfAttention(nn.Module):
     self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
     self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-    # key, value, query에 대한 선형변환 layer 초기화.
+    # key, value, query??????좏삎蹂??layer 珥덇린??
     self.query = nn.Linear(config.hidden_size, self.all_head_size)
     self.key = nn.Linear(config.hidden_size, self.all_head_size)
     self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
-    # 이 드롭아웃은 트랜스포머의 원래 구현에 따라 normalized attention scores에 적용된다.
-    # 다소 이례적이지만, 경험적으로 이것이 더 나은 성능을 제공한다고 알려져 있다.
+    # ???쒕∼?꾩썐? ?몃옖?ㅽ룷癒몄쓽 ?먮옒 援ы쁽???곕씪 normalized attention scores???곸슜?쒕떎.
+    # ?ㅼ냼 ?대??곸씠吏留? 寃쏀뿕?곸쑝濡??닿쾬?????섏? ?깅뒫???쒓났?쒕떎怨??뚮젮???덈떎.
     self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
   def transform(self, x, linear_layer):
-    # hidden_state (x) 를 사영하기 위해 k, v, q의 해당 linear_layer가 사용된다.
+    # hidden_state (x) 瑜??ъ쁺?섍린 ?꾪빐 k, v, q???대떦 linear_layer媛 ?ъ슜?쒕떎.
     proj = linear_layer(x)
-    # 다음으로, 프로젝션에 대해 여러 헤드를 생성해야 한다. 
-    # 이는 은닉 상태를 self.num_attention_heads로 분할하며, 
-    # 각 헤드는 self.attention_head_size 크기를 갖도록 한다.
+    # ?ㅼ쓬?쇰줈, ?꾨줈?앹뀡??????щ윭 ?ㅻ뱶瑜??앹꽦?댁빞 ?쒕떎. 
+    # ?대뒗 ????곹깭瑜?self.num_attention_heads濡?遺꾪븷?섎ŉ, 
+    # 媛??ㅻ뱶??self.attention_head_size ?ш린瑜?媛뽯룄濡??쒕떎.
     proj = rearrange(proj, 'b t (h d) -> b t h d', h=self.num_attention_heads)
-    # 적절히 전치하여 크기 [bs, num_attention_heads, seq_len, attention_head_size]인 프로젝션을 얻는다.
+    # ?곸젅???꾩튂?섏뿬 ?ш린 [bs, num_attention_heads, seq_len, attention_head_size]???꾨줈?앹뀡???삳뒗??
     proj = rearrange(proj, 'b t h d -> b h t d')
     return proj
 
   def attention(self, key, query, value, attention_mask):
 
-    ### 완성시켜야 할 빈 코드 블록
+    ### ?꾩꽦?쒖폒????鍮?肄붾뱶 釉붾줉
     # raise NotImplementedError
   
     # ref: Lecture Note (09.Transformers-2)
@@ -53,7 +53,7 @@ class CausalSelfAttention(nn.Module):
     # Causal mask (future token mask)
     # create causal mask (line 55 - Gemini used)
     causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=attention_scores.device), diagonal=1).bool()
-    attention_scores = attention_scores.masked_fill(causal_mask, -1e9)
+    attention_scores = attention_scores.masked_fill(causal_mask, -1e4)  # FP16 AMP compatible
 
     # Padding mask
     if attention_mask is not None:
@@ -79,13 +79,13 @@ class CausalSelfAttention(nn.Module):
     attention_mask: [bs, 1, 1, seq_len]
     output: [bs, seq_len, hidden_state]
     """
-    # 먼저, self.transform을 사용하여 multi-head attention에 필요한
-    # 각 토큰의 key, value, query를 생성해야 한다(함수 내부에 자세한 내용 있음).
-    # *_layer의 크기 = [bs, num_attention_heads, seq_len, attention_head_size].
+    # 癒쇱?, self.transform???ъ슜?섏뿬 multi-head attention???꾩슂??
+    # 媛??좏겙??key, value, query瑜??앹꽦?댁빞 ?쒕떎(?⑥닔 ?대????먯꽭???댁슜 ?덉쓬).
+    # *_layer???ш린 = [bs, num_attention_heads, seq_len, attention_head_size].
     key_layer = self.transform(hidden_states, self.key)
     value_layer = self.transform(hidden_states, self.value)
     query_layer = self.transform(hidden_states, self.query)
     
-    # multi-head attention 계산.
+    # multi-head attention 怨꾩궛.
     attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
     return attn_value
