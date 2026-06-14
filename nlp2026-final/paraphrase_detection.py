@@ -343,12 +343,16 @@ def test(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   
   is_ensemble = args.ensemble > 1
+  # NOTE: snapshots(state_dict)는 CPU로 로드한다. reverse+ensemble+boosting을 함께 쓸 때
+  # GPU 상태의 state_dict을 load_state_dict(strict=False)로 바로 올리면 boosting 어댑터
+  # 레이어(adaptor_layers) 파라미터 복사 중 CUDA device-side assert가 발생하기 때문이다.
+  # CPU로 로드한 뒤, 추론 루프에서 텐서를 하나씩 device로 옮겨 로드한다.
   if is_ensemble and os.path.exists(args.filepath + ".ensemble"):
-    saved = torch.load(args.filepath + ".ensemble", map_location=device)
+    saved = torch.load(args.filepath + ".ensemble", map_location="cpu")
     snapshots = saved['snapshots']
     saved_args = saved['args']
   else:
-    saved = torch.load(args.filepath, map_location=device)
+    saved = torch.load(args.filepath, map_location="cpu")
     snapshots = [saved['model']]
     saved_args = saved['args']
 
@@ -393,7 +397,9 @@ def test(args):
       batch_reverse_probs = []    # for reverse pair test
 
       for state_dict in snapshots:
-        model.load_state_dict(state_dict, strict=False)
+        # CPU에 보관된 snapshot을 device로 옮겨 로드 (device-side assert 회피)
+        state_dict_gpu = {k: v.to(device) for k, v in state_dict.items()}
+        model.load_state_dict(state_dict_gpu, strict=False)
 
         if model.boosting:
           for layer in model.adaptor_layers:
