@@ -16,6 +16,9 @@ from datasets import (
   SonnetsDataset,
 )
 
+YES_TOKEN_ID = 8505
+NO_TOKEN_ID  = 3919
+
 TQDM_DISABLE = False
 
 

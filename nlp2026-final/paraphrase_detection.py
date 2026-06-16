@@ -20,6 +20,7 @@ import math
 
 import numpy as np
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -194,6 +195,7 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  scaler = GradScaler()   # AMP scaler for FP16
   best_dev_acc = 0
   snapshots = []    # List for snapshot ensemble
 
@@ -262,42 +264,44 @@ def train(args):
       # no_t  = torch.tensor(NO_TOKEN_ID,  dtype=torch.long, device=labels.device)
       mapped_labels = torch.where(is_yes, torch.tensor(1, device=device), torch.tensor(0, device=device))
 
-      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
+      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
 
-      # Case: Use reverse pair
-      if args.reverse > 0.0:
-        logits_forward = model(b_ids, b_mask)
-        loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
+      with autocast():
+        # Case: Use reverse pair
+        if args.reverse > 0.0:
+          logits_forward = model(b_ids, b_mask)
+          loss_cross_entropy = F.cross_entropy(logits_forward, mapped_labels, reduction='mean')
 
-        b_ids_reverse = batch['reverse_token_ids'].to(device)
-        b_mask_reverse = batch['reverse_attention_mask'].to(device)
-        logits_reverse = model(b_ids_reverse, b_mask_reverse)
+          b_ids_reverse = batch['reverse_token_ids'].to(device)
+          b_mask_reverse = batch['reverse_attention_mask'].to(device)
+          logits_reverse = model(b_ids_reverse, b_mask_reverse)
 
-        p_forward = F.log_softmax(logits_forward, dim=-1)
-        p_backward = F.softmax(logits_reverse, dim=-1)
-        loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
+          p_forward = F.log_softmax(logits_forward, dim=-1)
+          p_backward = F.softmax(logits_reverse, dim=-1)
+          loss_kl_div = F.kl_div(p_forward, p_backward, reduction='batchmean')
 
-        loss = loss_cross_entropy + (args.reverse * loss_kl_div)
+          loss = loss_cross_entropy + (args.reverse * loss_kl_div)
 
-        # check disagreement of forward-reverse pair
-        preds_forward = torch.argmax(logits_forward, dim=1)
-        preds_reverse = torch.argmax(logits_reverse, dim=1)
-        train_disagr_count += (preds_forward != preds_reverse).sum().item()
-        num_samples += labels.size(0)
+          # check disagreement of forward-reverse pair
+          preds_forward = torch.argmax(logits_forward, dim=1)
+          preds_reverse = torch.argmax(logits_reverse, dim=1)
+          train_disagr_count += (preds_forward != preds_reverse).sum().item()
+          num_samples += labels.size(0)
 
-        preds = preds_forward
-        correct_forward = (preds_forward == mapped_labels)
-        correct_reverse = (preds_reverse == mapped_labels)
-        is_correct = correct_forward & correct_reverse
-      else:
-        logits = model(b_ids, b_mask)
-        preds = torch.argmax(logits, dim=1)
-        loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
-        is_correct = (preds == mapped_labels)
+          preds = preds_forward
+          correct_forward = (preds_forward == mapped_labels)
+          correct_reverse = (preds_reverse == mapped_labels)
+          is_correct = correct_forward & correct_reverse
+        else:
+          logits = model(b_ids, b_mask)
+          preds = torch.argmax(logits, dim=1)
+          loss = F.cross_entropy(logits, mapped_labels, reduction='mean')
+          is_correct = (preds == mapped_labels)
 
-      loss.backward()
-      optimizer.step()
+      scaler.scale(loss).backward()
+      scaler.step(optimizer)
+      scaler.update()
 
       if is_boosting and (not is_boosting_epoch):
         correct_mask = is_correct.cpu().numpy()
@@ -339,12 +343,16 @@ def test(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   
   is_ensemble = args.ensemble > 1
+  # NOTE: snapshots(state_dict)는 CPU로 로드한다. reverse+ensemble+boosting을 함께 쓸 때
+  # GPU 상태의 state_dict을 load_state_dict(strict=False)로 바로 올리면 boosting 어댑터
+  # 레이어(adaptor_layers) 파라미터 복사 중 CUDA device-side assert가 발생하기 때문이다.
+  # CPU로 로드한 뒤, 추론 루프에서 텐서를 하나씩 device로 옮겨 로드한다.
   if is_ensemble and os.path.exists(args.filepath + ".ensemble"):
-    saved = torch.load(args.filepath + ".ensemble", map_location=device)
+    saved = torch.load(args.filepath + ".ensemble", map_location="cpu")
     snapshots = saved['snapshots']
     saved_args = saved['args']
   else:
-    saved = torch.load(args.filepath, map_location=device)
+    saved = torch.load(args.filepath, map_location="cpu")
     snapshots = [saved['model']]
     saved_args = saved['args']
 
@@ -389,7 +397,9 @@ def test(args):
       batch_reverse_probs = []    # for reverse pair test
 
       for state_dict in snapshots:
-        model.load_state_dict(state_dict, strict=False)
+        # CPU에 보관된 snapshot을 device로 옮겨 로드 (device-side assert 회피)
+        state_dict_gpu = {k: v.to(device) for k, v in state_dict.items()}
+        model.load_state_dict(state_dict_gpu, strict=False)
 
         if model.boosting:
           for layer in model.adaptor_layers:
